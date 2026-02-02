@@ -166,8 +166,24 @@ class _SpeechQueue:
             queue_ms = (start_mono - item.enqueue_mono) * 1000.0
             request_ms = (item.response_mono - item.request_mono) * 1000.0
             try:
+                current_ctx = capture_context()
+                current_app = (current_ctx.app_name or "").strip()
+                item_app = (item.app_name or "").strip()
+                if current_app and item_app and current_app != item_app:
+                    if self._timeline:
+                        self._timeline.log(
+                            "tts_skip_stale",
+                            line_id=line_id,
+                            capture_id=item.capture_id,
+                            hash=line_hash,
+                            chars=len(line),
+                            age_ms=f"{age_ms:.0f}",
+                            app=_truncate(item_app),
+                            current_app=_truncate(current_app),
+                        )
+                    self._queue.task_done()
+                    continue
                 if self._timeline:
-                    current_ctx = capture_context()
                     self._timeline.log(
                         "tts_start",
                         line_id=line_id,
@@ -177,7 +193,7 @@ class _SpeechQueue:
                         age_ms=f"{age_ms:.0f}",
                         queue_ms=f"{queue_ms:.0f}",
                         request_ms=f"{request_ms:.0f}",
-                        app=_truncate(item.app_name),
+                        app=_truncate(item_app),
                         window=_truncate(item.window_title),
                         current_app=_truncate(current_ctx.app_name),
                         current_window=_truncate(current_ctx.window_title),

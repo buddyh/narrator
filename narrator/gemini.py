@@ -342,7 +342,7 @@ def _build_prompt(
         "You are analyzing a screenshot and app context to produce a sports-style narration. "
         "Return ONLY JSON.\n\n"
         "Rules:\n"
-        "- commentary: 1-2 punchy sentences, 160-240 chars total. Keep it tight.\n"
+        "- commentary: 1-2 punchy sentences, 120-180 chars total. Keep it tight and fast.\n"
         "- Must mention the app name or window title.\n"
         "- Include at least two concrete details from the screen (content cues for known apps; UI details for unknown apps).\n"
         "- Tone: sports announcer, witty, continuous, present tense with a funny edge.\n"
@@ -420,7 +420,7 @@ def _build_payload(
     generation_config: dict[str, Any] = {
         "temperature": config.gemini_temperature,
         "maxOutputTokens": config.gemini_max_output_tokens,
-        "thinkingConfig": {"thinkingBudget": 400},
+        "thinkingConfig": {"thinkingBudget": 256},
     }
     if structured:
         generation_config["responseMimeType"] = "application/json"
