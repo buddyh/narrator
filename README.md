@@ -10,7 +10,7 @@ Live narration of your screen activity on macOS. Captures your screen via Gemini
 | `nature` | David Attenborough documentary |
 | `horror` | Creeping dread, ominous foreshadowing |
 | `noir` | Hard-boiled detective narration |
-| `reality_tv` | Ditzy confessional booth commentary |
+| `reality_tv` | Reality TV confessional booth commentary |
 | `asmr` | Whispered meditation |
 | `wrestling` | BAH GAWD maximum hype announcer |
 

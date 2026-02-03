@@ -1372,7 +1372,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "nature":     "David Attenborough nature documentary",
         "horror":     "Creeping dread, ominous foreshadowing",
         "noir":       "Hard-boiled detective, rain-soaked cynicism",
-        "reality_tv": "Ditzy confessional booth, tech-clueless drama",
+        "reality_tv": "Reality TV confessional booth commentary",
         "asmr":       "Whispered meditation over mundane browsing",
         "wrestling":  "BAH GAWD maximum hype announcer",
     }

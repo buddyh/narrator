@@ -1,13 +1,13 @@
 ---
 name: screen-narrator
 description: "Live narration of your screen activity. Starts a background narrator that captures your screen, generates commentary via Gemini, and speaks it aloud with ElevenLabs TTS. Supports 7 narration styles (sports, nature, horror, noir, reality_tv, asmr, wrestling) with live switching."
-homepage: https://github.com/buddylee9399/narrator
+homepage: https://github.com/buddyh/narrator
 metadata: {"clawdbot":{"emoji":"","os":["darwin"],"requires":{"bins":["python3","tmux"],"envs":["GEMINI_API_KEY","ELEVENLABS_API_KEY"]}}}
 ---
 
 # Screen Narrator
 
-Live narration of your screen activity. Uses Gemini for vision + commentary and ElevenLabs for TTS. 7 styles from sports play-by-play to ditzy reality TV confessionals.
+Live narration of your screen activity. Uses Gemini for vision + commentary and ElevenLabs for TTS. 7 styles from sports play-by-play to reality TV confessionals.
 
 ## Setup
 
@@ -108,7 +108,7 @@ Status file returns JSON with: `style`, `profanity`, `paused`, `dual_lane`, `tur
 | `nature` | David Attenborough nature documentary |
 | `horror` | Creeping dread, ominous foreshadowing |
 | `noir` | Hard-boiled detective, rain-soaked cynicism |
-| `reality_tv` | Ditzy confessional booth, tech-clueless drama |
+| `reality_tv` | Reality TV confessional booth commentary |
 | `asmr` | Whispered meditation over mundane browsing |
 | `wrestling` | BAH GAWD maximum hype announcer |
 
