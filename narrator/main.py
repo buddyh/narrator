@@ -341,6 +341,10 @@ class _SpeechQueue:
             finally:
                 self._queue.task_done()
 
+    def update_config(self, config: AppConfig) -> None:
+        """Update the config used for TTS (voice selection, etc.)."""
+        self._config = config
+
     def enqueue(self, item: _SpeechItem) -> bool:
         if self._queue.full():
             return False
@@ -725,6 +729,9 @@ def _run_loop_gemini(
                 if runtime.dual_lane != dual_lane:
                     dual_lane = runtime.dual_lane
                     lane_cycle = itertools.cycle([_SHORT_LANE, _LONG_LANE]) if dual_lane else None
+                # Update speech queue config so TTS uses the new voice
+                if speech_queue:
+                    speech_queue.update_config(config)
                 # Swap ambient track if style changed
                 if config.narration_style != old_style:
                     new_wav = _resolve_ambient_wav(config)
