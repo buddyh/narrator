@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
-from typing import List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import yaml
 
 
 @dataclass(frozen=True)
@@ -50,32 +53,57 @@ class AppConfig:
     interval_sec: float
     min_gap_sec: float
     diff_threshold: float
+    narration_style: str
+    nature_voice_id: str
+    style_voice_ids: Dict[str, str]
+    style_ambient: Dict[str, str]
     ignore_apps: List[str]
     dry_run: bool
+    dual_lane: bool
 
 
 DEFAULT_MODEL_ID = "eleven_flash_v2_5"
 DEFAULT_OUTPUT_FORMAT = "pcm_16000"
 DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
 DEFAULT_GEMINI_TEMPERATURE = 0.7
-DEFAULT_GEMINI_MAX_OUTPUT_TOKENS = 2048
-DEFAULT_GEMINI_TIMEOUT_SEC = 30.0
-DEFAULT_GEMINI_MIN_CHARS = 100
-DEFAULT_GEMINI_MIN_WORDS = 16
+DEFAULT_GEMINI_MAX_OUTPUT_TOKENS = 1024
+DEFAULT_GEMINI_TIMEOUT_SEC = 15.0
+DEFAULT_GEMINI_MIN_CHARS = 80
+DEFAULT_GEMINI_MIN_WORDS = 14
 DEFAULT_GEMINI_MIN_SENTENCES = 1
-DEFAULT_GEMINI_MAX_RETRIES = 2
+DEFAULT_GEMINI_MAX_RETRIES = 1
 DEFAULT_GEMINI_HISTORY_LINES = 4
 DEFAULT_GEMINI_HISTORY_CONTEXTS = 6
 DEFAULT_QUEUE_MAX = 1
 DEFAULT_PROFANITY_LEVEL = "high"
+DEFAULT_NARRATION_STYLE = "sports"
+VALID_NARRATION_STYLES = {
+    "sports", "nature", "horror", "noir", "reality_tv",
+    "asmr", "wrestling",
+}
 DEFAULT_AMBIENT_GAIN = 0.08
-DEFAULT_AMBIENT_CROSSFADE_SEC = 0.25
+DEFAULT_AMBIENT_CROSSFADE_SEC = 1.5
 DEFAULT_FALLBACK_MIN_GAP_SEC = 3.0
 DEFAULT_MAX_STALE_SEC = 20.0
 DEFAULT_DROP_STALE = True
-DEFAULT_INTERVAL_SEC = 5.0
-DEFAULT_MIN_GAP_SEC = 6.0
+DEFAULT_INTERVAL_SEC = 3.0
+DEFAULT_MIN_GAP_SEC = 4.0
 DEFAULT_DIFF_THRESHOLD = 8.0
+
+CONFIG_PATH = Path.home() / ".narrator" / "config.yaml"
+
+
+def _load_yaml_config(path: Optional[Path] = None) -> Dict[str, Any]:
+    """Load YAML config file. Returns empty dict if not found."""
+    p = path or CONFIG_PATH
+    if not p.exists():
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        return data if isinstance(data, dict) else {}
+    except (yaml.YAMLError, OSError):
+        return {}
 
 
 def _split_list(value: str) -> List[str]:
@@ -144,7 +172,14 @@ def _read_bool(value: str) -> bool:
 
 
 def load_config(dry_run: bool = False, require_gemini: bool = False) -> AppConfig:
-    """Load configuration from environment variables."""
+    """Load configuration from ~/.narrator/config.yaml + environment variables.
+
+    YAML provides defaults; env vars override everything.
+    """
+    yaml_cfg = _load_yaml_config()
+    yaml_voices: Dict[str, str] = yaml_cfg.get("voices", {}) or {}
+    yaml_ambient: Dict[str, str] = yaml_cfg.get("ambient", {}) or {}
+    yaml_defaults: Dict[str, Any] = yaml_cfg.get("defaults", {}) or {}
 
     api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
     voice_id = os.getenv("ELEVENLABS_VOICE_ID", "").strip()
@@ -242,8 +277,9 @@ def load_config(dry_run: bool = False, require_gemini: bool = False) -> AppConfi
         DEFAULT_QUEUE_MAX,
         "NARRATOR_QUEUE_MAX",
     )
+    yaml_profanity = str(yaml_defaults.get("profanity", "")).strip().lower()
     profanity_level = os.getenv(
-        "NARRATOR_PROFANITY", str(DEFAULT_PROFANITY_LEVEL)
+        "NARRATOR_PROFANITY", yaml_profanity or str(DEFAULT_PROFANITY_LEVEL)
     ).strip().lower()
     if profanity_level not in {"low", "medium", "high"}:
         profanity_level = DEFAULT_PROFANITY_LEVEL
@@ -294,7 +330,44 @@ def load_config(dry_run: bool = False, require_gemini: bool = False) -> AppConfi
         os.getenv("NARRATOR_DIFF_THRESHOLD", str(DEFAULT_DIFF_THRESHOLD))
     )
 
+    yaml_style = str(yaml_defaults.get("style", "")).strip().lower()
+    narration_style = os.getenv(
+        "NARRATOR_STYLE", yaml_style or DEFAULT_NARRATION_STYLE
+    ).strip().lower()
+    if narration_style not in VALID_NARRATION_STYLES:
+        narration_style = DEFAULT_NARRATION_STYLE
+
+    nature_voice_id = os.getenv("NARRATOR_NATURE_VOICE_ID", "").strip()
+
+    # Build style voice IDs: YAML first, then env vars override
+    style_voice_ids: Dict[str, str] = {}
+    for s, vid in yaml_voices.items():
+        s_lower = str(s).strip().lower()
+        if s_lower in VALID_NARRATION_STYLES and vid:
+            style_voice_ids[s_lower] = str(vid).strip()
+    for s in VALID_NARRATION_STYLES:
+        env_key = f"NARRATOR_{s.upper()}_VOICE_ID"
+        vid = os.getenv(env_key, "").strip()
+        if vid:
+            style_voice_ids[s] = vid
+    # Backward compat: nature_voice_id -> style_voice_ids["nature"]
+    if nature_voice_id and "nature" not in style_voice_ids:
+        style_voice_ids["nature"] = nature_voice_id
+
+    # Build style ambient paths from YAML
+    style_ambient: Dict[str, str] = {}
+    for s, path in yaml_ambient.items():
+        s_lower = str(s).strip().lower()
+        if s_lower in VALID_NARRATION_STYLES and path:
+            expanded = os.path.expanduser(str(path).strip())
+            if os.path.isfile(expanded):
+                style_ambient[s_lower] = expanded
+
     ignore_apps = _split_list(os.getenv("NARRATOR_IGNORE_APPS", ""))
+
+    dual_lane = _read_bool(os.getenv("NARRATOR_DUAL_LANE", ""))
+    if dual_lane:
+        queue_max = max(queue_max, 2)
 
     return AppConfig(
         api_key=api_key,
@@ -336,6 +409,11 @@ def load_config(dry_run: bool = False, require_gemini: bool = False) -> AppConfi
         interval_sec=interval_sec,
         min_gap_sec=min_gap_sec,
         diff_threshold=diff_threshold,
+        narration_style=narration_style,
+        nature_voice_id=nature_voice_id,
+        style_voice_ids=style_voice_ids,
+        style_ambient=style_ambient,
         ignore_apps=ignore_apps,
         dry_run=dry_run,
+        dual_lane=dual_lane,
     )

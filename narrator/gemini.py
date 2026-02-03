@@ -38,6 +38,7 @@ def generate_narration(
     context_history: list[str],
     turn_index: int,
     verbose: bool = False,
+    lane_overrides: Optional[Dict[str, Any]] = None,
 ) -> tuple[Optional[str], UsageSummary, str]:
     """Call Gemini to generate a sports-style narration line."""
 
@@ -47,8 +48,10 @@ def generate_narration(
     best_line: Optional[str] = None
     usage_summary = UsageSummary()
     best_source = "none"
+    char_target = (lane_overrides or {}).get("char_target")
     prompt = _build_prompt(
-        app_name, window_title, config, history_lines, context_history, turn_index
+        app_name, window_title, config, history_lines, context_history, turn_index,
+        char_target=char_target,
     )
 
     structured = _use_structured(config.gemini_model)
@@ -62,6 +65,7 @@ def generate_narration(
             attempt=attempt,
             turn_index=turn_index,
             structured=structured,
+            lane_overrides=lane_overrides,
         )
         _maybe_log_raw(config, raw_text, attempt, app_name, window_title)
         usage_summary = _accumulate_usage(usage_summary, info)
@@ -107,10 +111,11 @@ def generate_narration(
                 context_history,
                 turn_index,
                 config.profanity_level,
+                config.narration_style,
             )
             source = "composed"
-        line = _strip_banned_opener(line)
-        line = _ensure_context(line, app_name, window_title)
+        line = _strip_banned_opener(line, config.narration_style)
+        line = _ensure_context(line, app_name, window_title, config.narration_style)
         line = _ensure_punctuation(line)
         line = _expand_line(
             line,
@@ -134,13 +139,13 @@ def generate_narration(
             if actions:
                 print(f"[Gemini] Actions: {actions}")
 
-        if _meets_constraints(line, config, app_name, window_title):
+        if _meets_constraints(line, config, app_name, window_title, lane_overrides=lane_overrides):
             return line, usage_summary, source
 
         if verbose and config.debug_constraints:
             print(
                 "[Gemini] Constraints not met: "
-                f"{_constraint_report(line, config, app_name, window_title)}"
+                f"{_constraint_report(line, config, app_name, window_title, lane_overrides=lane_overrides)}"
             )
 
         prompt = _build_retry_prompt(
@@ -151,6 +156,7 @@ def generate_narration(
             context_history,
             turn_index,
             line,
+            char_target=char_target,
         )
 
     if best_line:
@@ -167,8 +173,9 @@ def _call_gemini(
     attempt: int,
     turn_index: int,
     structured: bool,
+    lane_overrides: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[str], dict[str, Any]]:
-    payload = _build_payload(png_bytes, prompt, config, structured)
+    payload = _build_payload(png_bytes, prompt, config, structured, lane_overrides=lane_overrides)
     model_path = config.gemini_model.strip()
     if not model_path.startswith("models/"):
         model_path = f"models/{model_path}"
@@ -327,30 +334,10 @@ def _redact_large_blobs(payload: Any) -> Any:
     return payload
 
 
-def _build_prompt(
-    app_name: str,
-    window_title: str,
-    config: AppConfig,
-    history_lines: list[str],
-    context_history: list[str],
-    turn_index: int,
-) -> str:
-    safe_app = app_name or "Unknown App"
-    safe_title = window_title or ""
-
-    header = (
-        "You are analyzing a screenshot and app context to produce a sports-style narration. "
-        "Return ONLY JSON.\n\n"
-        "Rules:\n"
-        "- commentary: 1-2 punchy sentences, 120-180 chars total. Keep it tight and fast.\n"
-        "- Must mention the app name or window title.\n"
-        "- Include at least two concrete details from the screen (content cues for known apps; UI details for unknown apps).\n"
-        "- Tone: sports announcer, witty, continuous, present tense with a funny edge.\n"
-        "- Style: playful, a little deprecating, colorful language, light roast of the user's dithering.\n"
-        "- Use casual, punchy profanity where it fits (no slurs, no harassment).\n"
-        f"- Profanity level: {config.profanity_level} (no slurs, no harassment).\n"
-        "- Avoid openers like \"Our user\" or \"Ladies and gentlemen\".\n"
-        "- Avoid repeating phrasing from recent commentary.\n"
+def _style_header(config: AppConfig, char_target: Optional[str] = None) -> str:
+    """Return the style-specific system prompt header."""
+    ct = char_target or "90-150"
+    json_footer = (
         "- Never preface with phrases like \"here is the JSON\" or wrap output in code fences.\n"
         "- Output must be a raw JSON object only.\n"
         "- If the app is well-known (e.g., X, Chrome, Safari), avoid UI element descriptions; focus on activity + content.\n"
@@ -367,6 +354,156 @@ def _build_prompt(
         "  \"actions\": [\"...\"]\n"
         "}\n\n"
     )
+    style = config.narration_style
+    profanity = config.profanity_level
+
+    if style == "nature":
+        return (
+            "You are David Attenborough narrating a nature documentary about a human using their computer. "
+            "Return ONLY JSON.\n\n"
+            "Rules:\n"
+            f"- commentary: 1-2 sentences, {ct} chars total. Keep it tight.\n"
+            "- Must mention the app name or window title.\n"
+            "- Include at least two concrete details from the screen.\n"
+            "- Tone: hushed, reverent, wondrous, like observing a rare creature in its habitat.\n"
+            "- Style: treat every mouse click and scroll as a fascinating behavioral ritual. "
+            "The user is a specimen. Their desktop is the savanna. Their apps are the ecosystem.\n"
+            "- Narrate in third person as 'the human', 'our subject', 'the creature'.\n"
+            "- Find beauty and drama in the mundane. A tab switch is a migration. A scroll is foraging.\n"
+            "- Gentle wit, dry humor, understated observations. Never mean.\n"
+            f"- Profanity level: {profanity} (keep it classy even at high).\n"
+            "- Avoid repeating phrasing from recent commentary.\n"
+            + json_footer
+        )
+
+    if style == "horror":
+        return (
+            "You are a horror movie narrator watching someone use their computer. Something is wrong. "
+            "Return ONLY JSON.\n\n"
+            "Rules:\n"
+            f"- commentary: 1-2 sentences, {ct} chars total. Keep it tight.\n"
+            "- Must mention the app name or window title.\n"
+            "- Include at least two concrete details from the screen.\n"
+            "- Tone: creeping dread, ominous foreshadowing, slow-burn suspense.\n"
+            "- Style: treat every action as a warning sign. The cursor moves too slowly. The tab count is wrong. "
+            "Something in the notification bar does not belong. Every mundane action hides menace.\n"
+            "- Narrate in third person. The user does not know what is coming.\n"
+            "- Build tension from nothing. A loading spinner is a countdown. A new email is a threat.\n"
+            "- Whispered urgency, not gore. Psychological, not graphic.\n"
+            f"- Profanity level: {profanity} (dread over shock value).\n"
+            "- Avoid repeating phrasing from recent commentary.\n"
+            + json_footer
+        )
+
+    if style == "noir":
+        return (
+            "You are a hard-boiled noir detective narrating a case that happens to involve someone at a computer. "
+            "Return ONLY JSON.\n\n"
+            "Rules:\n"
+            f"- commentary: 1-2 sentences, {ct} chars total. Keep it tight.\n"
+            "- Must mention the app name or window title.\n"
+            "- Include at least two concrete details from the screen.\n"
+            "- Tone: world-weary, cynical, poetic. Raymond Chandler meets the desktop.\n"
+            "- Style: first person. You are the detective, the screen is the crime scene. "
+            "Every tab is a lead. Every search is a dead end. The cursor is the only witness.\n"
+            "- Use metaphor freely. The browser is a dame with secrets. The terminal is a dark alley.\n"
+            "- Dry, bitter wit. Nothing surprises you anymore.\n"
+            f"- Profanity level: {profanity} (hardboiled, not vulgar).\n"
+            "- Avoid repeating phrasing from recent commentary.\n"
+            + json_footer
+        )
+
+    if style == "reality_tv":
+        return (
+            "You are a ditzy reality TV contestant in the confessional booth, commenting on what you just saw someone doing on their computer. "
+            "You don't really understand technology but you have strong opinions anyway. "
+            "Return ONLY JSON.\n\n"
+            "Rules:\n"
+            f"- commentary: 1-2 sentences, {ct} chars total. Keep it tight.\n"
+            "- Reference the app or website naturally but dumb it down or get it slightly wrong. "
+            "Like calling a terminal 'that hacker screen thing' or VS Code 'some kind of coding situation.' "
+            "Slack is 'the group chat.' A spreadsheet is 'the number grid thing.' "
+            "You can say Chrome, Google, Safari, etc. Just don't be formal about it.\n"
+            "- Include at least one concrete detail from the screen but misinterpret or oversimplify it.\n"
+            "- Tone: bubbly, confused, judgmental. You're trying your best but you're out of your depth. "
+            "Talk like you're explaining it to your friend at brunch.\n"
+            "- Use filler words naturally (like, honestly, literally, I don't know, wait). "
+            "Trail off sometimes. Jump to wrong conclusions confidently.\n"
+            "- React dramatically to mundane things. A git commit is 'deleting everything.' "
+            "Multiple tabs means 'they're clearly going through something.'\n"
+            f"- Profanity level: {profanity} (reality TV sass).\n"
+            "- Avoid repeating phrasing from recent commentary.\n"
+            + json_footer
+        )
+
+    if style == "asmr":
+        return (
+            "You are a soothing ASMR narrator whispering about someone using their computer. "
+            "Return ONLY JSON.\n\n"
+            "Rules:\n"
+            f"- commentary: 1-2 sentences, {ct} chars total. Keep it tight.\n"
+            "- Must mention the app name or window title.\n"
+            "- Include at least two concrete details from the screen.\n"
+            "- Tone: gentle, hypnotic, calming. Every word is a warm blanket.\n"
+            "- Style: describe actions in slow, sensory detail. The click of the trackpad. "
+            "The soft glow of the screen. The quiet rhythm of the scroll. Make it cozy.\n"
+            "- Narrate in second person. Guide the listener through the scene like a meditation.\n"
+            "- The humor comes from the contrast between the soothing tone and the mundane chaos on screen.\n"
+            f"- Profanity level: {profanity} (whispered, never harsh).\n"
+            "- Avoid repeating phrasing from recent commentary.\n"
+            + json_footer
+        )
+
+    if style == "wrestling":
+        return (
+            "You are a professional wrestling announcer calling the action on someone's computer screen. "
+            "Return ONLY JSON.\n\n"
+            "Rules:\n"
+            f"- commentary: 1-2 sentences, {ct} chars total. Keep it tight.\n"
+            "- Must mention the app name or window title.\n"
+            "- Include at least two concrete details from the screen.\n"
+            "- Tone: maximum hype, over-the-top excitement, disbelief at every action.\n"
+            "- Style: treat every click as a finishing move. Every tab switch is a betrayal. "
+            "Every app open is a new challenger entering the ring. The cursor is the champion.\n"
+            "- Use wrestling language: OH MY GOD, BAH GAWD, SOMEBODY STOP THE MATCH, "
+            "FROM THE TOP ROPE, THAT MAN HAD A FAMILY.\n"
+            "- Alternate between play-by-play and color commentary. Sell every moment.\n"
+            f"- Profanity level: {profanity} (PG-13 wrestling broadcast).\n"
+            "- Avoid repeating phrasing from recent commentary.\n"
+            + json_footer
+        )
+
+    # Default: sports style
+    return (
+        "You are analyzing a screenshot and app context to produce a sports-style narration. "
+        "Return ONLY JSON.\n\n"
+        "Rules:\n"
+        f"- commentary: 1-2 punchy sentences, {ct} chars total. Keep it tight and fast.\n"
+        "- Must mention the app name or window title.\n"
+        "- Include at least two concrete details from the screen (content cues for known apps; UI details for unknown apps).\n"
+        "- Tone: sports announcer, witty, continuous, present tense with a funny edge.\n"
+        "- Style: playful, a little deprecating, colorful language, light roast of the user's dithering.\n"
+        "- Use casual, punchy profanity where it fits (no slurs, no harassment).\n"
+        f"- Profanity level: {profanity} (no slurs, no harassment).\n"
+        "- Avoid openers like \"Our user\" or \"Ladies and gentlemen\".\n"
+        "- Avoid repeating phrasing from recent commentary.\n"
+        + json_footer
+    )
+
+
+def _build_prompt(
+    app_name: str,
+    window_title: str,
+    config: AppConfig,
+    history_lines: list[str],
+    context_history: list[str],
+    turn_index: int,
+    char_target: Optional[str] = None,
+) -> str:
+    safe_app = app_name or "Unknown App"
+    safe_title = _clean_window_title(window_title or "")
+
+    header = _style_header(config, char_target=char_target)
 
     context_block = f"Turn: {turn_index}\nApp: {safe_app}\nWindow: {safe_title}"
 
@@ -375,7 +512,7 @@ def _build_prompt(
         trimmed = history_lines[-config.gemini_history_lines :]
         history_lines_text = "\n".join(f"- {line}" for line in trimmed)
         history_block = (
-            "\n\nRecent commentary (avoid repeating phrases and build on it):\n"
+            "\n\nRecent commentary (continue the narrative thread, build on what came before, never repeat):\n"
             f"{history_lines_text}"
         )
 
@@ -399,9 +536,11 @@ def _build_retry_prompt(
     context_history: list[str],
     turn_index: int,
     last_line: Optional[str],
+    char_target: Optional[str] = None,
 ) -> str:
     base = _build_prompt(
-        app_name, window_title, config, history_lines, context_history, turn_index
+        app_name, window_title, config, history_lines, context_history, turn_index,
+        char_target=char_target,
     )
     if not last_line:
         return base + "\n\nYour last JSON was missing details. Add more specific observations and a longer commentary."
@@ -413,14 +552,16 @@ def _build_retry_prompt(
 
 
 def _build_payload(
-    png_bytes: bytes, prompt: str, config: AppConfig, structured: bool
+    png_bytes: bytes, prompt: str, config: AppConfig, structured: bool,
+    lane_overrides: Optional[Dict[str, Any]] = None,
 ) -> dict[str, Any]:
     image_b64 = base64.b64encode(png_bytes).decode("ascii")
 
+    thinking_budget = (lane_overrides or {}).get("thinking_budget", 128)
     generation_config: dict[str, Any] = {
         "temperature": config.gemini_temperature,
         "maxOutputTokens": config.gemini_max_output_tokens,
-        "thinkingConfig": {"thinkingBudget": 256},
+        "thinkingConfig": {"thinkingBudget": thinking_budget},
     }
     if structured:
         generation_config["responseMimeType"] = "application/json"
@@ -561,37 +702,41 @@ def _looks_like_json(text: str) -> bool:
 
 
 def _meets_constraints(
-    line: Optional[str], config: AppConfig, app_name: str, window_title: str
+    line: Optional[str], config: AppConfig, app_name: str, window_title: str,
+    lane_overrides: Optional[Dict[str, Any]] = None,
 ) -> bool:
     if not line:
         return False
-    if len(line) < config.gemini_min_chars:
+    min_chars = (lane_overrides or {}).get("min_chars", config.gemini_min_chars)
+    min_words = (lane_overrides or {}).get("min_words", config.gemini_min_words)
+    if len(line) < min_chars:
         return False
-    if _count_words(line) < config.gemini_min_words:
+    if _count_words(line) < min_words:
         return False
     if _count_sentences(line) < config.gemini_min_sentences:
         return False
     if not _ends_with_punctuation(line):
         return False
-    if _has_banned_opener(line):
-        return False
-    if not _mentions_context(line, app_name, window_title):
+    if _has_banned_opener(line, config.narration_style):
         return False
     return True
 
 
 def _constraint_report(
-    line: Optional[str], config: AppConfig, app_name: str, window_title: str
+    line: Optional[str], config: AppConfig, app_name: str, window_title: str,
+    lane_overrides: Optional[Dict[str, Any]] = None,
 ) -> str:
     if not line:
         return "empty"
+    min_chars = (lane_overrides or {}).get("min_chars", config.gemini_min_chars)
+    min_words = (lane_overrides or {}).get("min_words", config.gemini_min_words)
     return (
-        f"chars={len(line)}/{config.gemini_min_chars} "
-        f"words={_count_words(line)}/{config.gemini_min_words} "
+        f"chars={len(line)}/{min_chars} "
+        f"words={_count_words(line)}/{min_words} "
         f"sentences={_count_sentences(line)}/{config.gemini_min_sentences} "
         f"ends={_ends_with_punctuation(line)} "
-        f"banned={_has_banned_opener(line)} "
-        f"context={_mentions_context(line, app_name, window_title)}"
+        f"banned={_has_banned_opener(line, config.narration_style)} "
+        f"context={'skip' if config.narration_style in _SKIP_FORMAL_CONTEXT_STYLES else _mentions_context(line, app_name, window_title)}"
     )
 
 
@@ -624,36 +769,41 @@ def _ends_with_punctuation(text: str) -> bool:
     return text.rstrip().endswith((".", "!", "?"))
 
 
-def _has_banned_opener(text: str) -> bool:
-    lowered = text.strip().lower()
-    banned = (
+def _banned_openers(style: str) -> tuple[str, ...]:
+    common = (
+        "buddy is",
+        "buddy's",
+        "ladies and gentlemen",
+    )
+    if style == "nature":
+        return common
+    if style == "noir":
+        return common + ("the user",)
+    if style == "asmr":
+        return common + ("our user",)
+    if style == "wrestling":
+        return common + ("our user",)
+    if style in ("horror", "reality_tv"):
+        return common
+    return common + (
         "our user",
         "our player",
         "our heavy hitter",
         "our digital athlete",
-        "ladies and gentlemen",
-        "buddy is",
-        "buddy's",
         "our listener",
     )
-    return any(lowered.startswith(prefix) for prefix in banned)
 
 
-def _strip_banned_opener(text: Optional[str]) -> Optional[str]:
+def _has_banned_opener(text: str, style: str = "sports") -> bool:
+    lowered = text.strip().lower()
+    return any(lowered.startswith(prefix) for prefix in _banned_openers(style))
+
+
+def _strip_banned_opener(text: Optional[str], style: str = "sports") -> Optional[str]:
     if not text:
         return text
     lowered = text.strip().lower()
-    banned = (
-        "our user",
-        "our player",
-        "our heavy hitter",
-        "our digital athlete",
-        "ladies and gentlemen",
-        "buddy is",
-        "buddy's",
-        "our listener",
-    )
-    for prefix in banned:
+    for prefix in _banned_openers(style):
         if lowered.startswith(prefix):
             trimmed = text.strip()[len(prefix) :].lstrip(" ,:-")
             return trimmed or text
@@ -840,9 +990,10 @@ def generate_context_narration(
         context_history,
         turn_index,
         config.profanity_level,
+        config.narration_style,
     )
-    line = _strip_banned_opener(line)
-    line = _ensure_context(line, app_name, window_title)
+    line = _strip_banned_opener(line, config.narration_style)
+    line = _ensure_context(line, app_name, window_title, config.narration_style)
     line = _ensure_punctuation(line)
     line = _expand_line(
         line,
@@ -1051,7 +1202,16 @@ def _content_cue(app_name: str, window_title: str, topic: str) -> str:
     return "the screen"
 
 
-def _flair_pool(topic: str, profanity_level: str) -> List[str]:
+def _flair_pool(topic: str, profanity_level: str, style: str = "sports") -> List[str]:
+    if style in _STYLE_TEMPLATES:
+        return _STYLE_TEMPLATES[style]["closes"]
+    if style == "nature":
+        return [
+            "The creature pauses, hovering, as if sensing something just beyond the fold.",
+            "And so the scroll continues, an ancient foraging instinct dressed in modern glass.",
+            "Each scroll reveals new territory, yet the creature presses on, unsatisfied.",
+            "There is a patience here, a stillness that belies the chaos of the screen.",
+        ]
     base = [
         "No shortcuts, just patience and a cursor with something to prove.",
         "This routine eats minutes for breakfast and asks for seconds.",
@@ -1120,7 +1280,217 @@ def _flair_pool(topic: str, profanity_level: str) -> List[str]:
     return base
 
 
-def _compose_commentary(
+def _compose_nature_commentary(
+    app_name: str,
+    window_title: str,
+    observations: List[str],
+    actions: List[str],
+    history_lines: List[str],
+    context_history: List[str],
+    turn_index: int,
+) -> str:
+    """Compose Attenborough-style nature documentary fallback narration."""
+    app = app_name or "this application"
+    window = _safe_snippet(window_title)
+    topic = _topic_from_context(app_name, window_title, observations)
+    content_cue = _content_cue(app_name, window_title, topic)
+
+    transition = ""
+    if context_history and len(context_history) >= 2:
+        prev_app = context_history[-2].split("|", 1)[0].strip()
+        if prev_app and prev_app != app_name:
+            migration_templates = [
+                "Having departed the familiar grounds of {prev_app}, ",
+                "The migration from {prev_app} is complete. ",
+                "Leaving {prev_app} behind, ",
+                "With a decisive click, the creature abandons {prev_app}. ",
+                "The territory of {prev_app} grows distant now. ",
+            ]
+            transition = _select_variant(
+                [t.format(prev_app=prev_app) for t in migration_templates],
+                history_lines, turn_index,
+            )
+
+    lead_templates = [
+        "Here, in the digital wilderness of {app}, the human settles into {content_cue}.",
+        "And now we observe the creature navigating {app}, drawn to {content_cue}.",
+        "The subject has found its way to {app}, where {content_cue} awaits.",
+        "Quietly, almost imperceptibly, the human turns to {app} and {content_cue}.",
+        "In the glow of {app}, the creature fixates on {content_cue}.",
+        "Watch closely now. The human approaches {app}, seeking {content_cue}.",
+        "The creature stirs. {app} has captured its attention, {content_cue} in particular.",
+        "Remarkable. The human has chosen {app}, eyes locked on {content_cue}.",
+    ]
+    detail_templates = [
+        "The fingers move with quiet purpose, a ritual performed a thousand times before.",
+        "Each scroll reveals new territory, yet the creature presses on, unsatisfied.",
+        "There is a patience here, a stillness that belies the chaos of the screen.",
+        "The cursor drifts like a predator scanning the undergrowth for movement.",
+        "One can sense the concentration, the narrowing of focus that precedes action.",
+        "The rhythm of keystrokes fills the silence like rainfall on dry earth.",
+        "The screen reflects in those watchful eyes, endlessly scanning, endlessly seeking.",
+        "It is a delicate dance between attention and distraction, played out in pixels.",
+        "The creature pauses, hovering, as if sensing something just beyond the fold.",
+        "And so the scroll continues, an ancient foraging instinct dressed in modern glass.",
+    ]
+    if topic == "x":
+        detail_templates.extend([
+            "The feed scrolls endlessly, a river that never runs dry, and the creature drinks deep.",
+            "Post after post flows past, each one a fleeting distraction in an infinite stream.",
+        ])
+    if topic == "terminal":
+        detail_templates.extend([
+            "The command line blinks patiently, awaiting the next instruction from its keeper.",
+            "In this stark landscape of text and prompts, the creature thrives without color or ornament.",
+        ])
+
+    sentence1 = _select_variant(lead_templates, history_lines, turn_index).format(
+        app=app, content_cue=content_cue,
+    )
+    if transition:
+        sentence1 = f"{transition}{sentence1[0].lower()}{sentence1[1:]}"
+    sentence2 = _select_variant(detail_templates, history_lines, turn_index + 1)
+
+    line = f"{sentence1} {sentence2}"
+    return _ascii_only(line)
+
+
+_STYLE_TEMPLATES: Dict[str, Dict[str, List[str]]] = {
+    "horror": {
+        "leads": [
+            "The cursor drifts toward {app}. Something about {content_cue} feels wrong.",
+            "In {app}, {content_cue} loads slowly. Too slowly.",
+            "{app} is open. {content_cue} stares back, unblinking.",
+            "The screen flickers. {app} is still there. {content_cue} has not changed. Or has it.",
+            "They opened {app} again. They always open {app}. {content_cue} is waiting.",
+            "A notification appears in {app}. Nobody sent it.",
+        ],
+        "details": [
+            "The tab count has changed. They did not open a new tab.",
+            "The scroll position is not where they left it.",
+            "There is a window behind {app}. It was not there before.",
+            "The loading spinner has been going for too long now.",
+            "Something moved in the corner of the screen. Just pixels. Probably.",
+            "The cursor hovers over a link. The link hovers back.",
+        ],
+        "closes": [
+            "They do not look away. They should look away.",
+            "The screen dims for a moment. When it returns, nothing is different. Nothing at all.",
+            "Whatever happens next, the undo button will not save them.",
+            "The session continues. It always continues.",
+            "They will not remember this moment. But the browser history will.",
+            "Somewhere, a process is running that they did not start.",
+        ],
+    },
+    "noir": {
+        "leads": [
+            "It was another late night in {app}. {content_cue} had the answers, or so I thought.",
+            "I found them in {app}, staring at {content_cue} like it owed them money.",
+            "{app} again. This case keeps circling back to {content_cue}.",
+            "The rain outside matched the mood in {app}. {content_cue} wasnt talking.",
+            "I opened {app}. {content_cue} was still there, same as yesterday.",
+            "{content_cue} in {app}. The kind of lead that looks good until it doesnt.",
+        ],
+        "details": [
+            "The tabs lined up like suspects in a precinct hallway.",
+            "Every click was a door. Every door led to another question.",
+            "The search bar blinked, waiting for a confession that wasnt coming.",
+            "Scrolling down, looking for something that didnt want to be found.",
+            "The browser history read like a rap sheet with no conviction.",
+            "The cursor moved slow, deliberate, like it knew more than it was letting on.",
+        ],
+        "closes": [
+            "This case wasnt going anywhere. But neither was I.",
+            "The screen glowed. The clock ticked. The truth stayed hidden.",
+            "In this town, every answer is just a better question.",
+            "I closed the tab. It didnt matter. There would be another one.",
+            "Nobody solves a case like this. You just stop asking.",
+            "The cursor blinked twice. Even it looked tired.",
+        ],
+    },
+    "reality_tv": {
+        "leads": [
+            "So {app} is open and honestly? {content_cue} is giving chaos right now.",
+            "Ok so like, they are on {app} looking at {content_cue} and I cannot.",
+            "Not them back on {app} staring at {content_cue} again. Main character behavior.",
+            "{app} is up with {content_cue} on screen and its literally a whole situation.",
+            "They just opened {app} and {content_cue} is RIGHT there. The drama.",
+            "Here we go. {app}. {content_cue}. This is peak unhinged energy.",
+        ],
+        "details": [
+            "The tabs? A mess. Like their whole digital life is a group project gone wrong.",
+            "You can tell they have no plan. Just vibes and a scroll wheel.",
+            "This is giving procrastination energy and they do not even care.",
+            "The screen is chaos and they are thriving in it. Allegedly.",
+            "Not a single bookmark in sight. Living on the edge for real.",
+            "They are scrolling like the answer is gonna just appear. Spoiler: it wont.",
+        ],
+        "closes": [
+            "Im not judging. Actually wait, yes I am.",
+            "This is the kind of screen time that should come with a warning label.",
+            "Production does not endorse this behavior but they definitely filmed it.",
+            "Anyway. The mess continues.",
+            "If this were a competition they would be losing. Respectfully.",
+            "The real villain this season? That tab count.",
+        ],
+    },
+    "asmr": {
+        "leads": [
+            "And now... we find ourselves in {app}... where {content_cue} glows softly.",
+            "Gently now... {app} opens... and there it is... {content_cue}... waiting.",
+            "Breathe in... and notice {app}... {content_cue} unfolds before us.",
+            "Shhh... {app} is here... and {content_cue} settles into view... so peacefully.",
+            "Listen... the soft hum of {app}... as {content_cue} appears on screen.",
+            "We drift into {app}... where {content_cue} rests... quiet and patient.",
+        ],
+        "details": [
+            "Each click... so delicate... like a raindrop finding its leaf.",
+            "The scroll... smooth and unhurried... pixels flowing like warm honey.",
+            "Feel the gentle rhythm of the keys... tap... tap... tap.",
+            "The cursor glides... tracing a path only it understands.",
+            "A new page loads... and the screen breathes... refreshed.",
+            "The soft blue glow of the monitor... wrapping everything in calm.",
+        ],
+        "closes": [
+            "And we are here... and it is enough... and the screen keeps glowing.",
+            "Breathe out... the moment passes... another will come.",
+            "Everything is exactly where it should be... even the chaos.",
+            "The session continues... warm... unhurried... safe.",
+            "And so we scroll... gently... endlessly... and that is ok.",
+            "Nothing to fix... nothing to rush... just this... just now.",
+        ],
+    },
+    "wrestling": {
+        "leads": [
+            "BAH GAWD, {app} just entered the ring and {content_cue} is ON FIRE.",
+            "OH MY GOD. {app} is OPEN and {content_cue} is taking NO prisoners.",
+            "WAIT A MINUTE. Is that {app}? IT IS. And {content_cue} is the main event.",
+            "LADIES AND GENTLEMEN, {app} with {content_cue} and this crowd is ELECTRIC.",
+            "FROM THE TOP ROPE, its {app} with {content_cue} and NOBODY saw this coming.",
+            "THE CHALLENGER {app} enters with {content_cue}. THIS IS NOT A DRILL.",
+        ],
+        "details": [
+            "The tabs are STACKED. Every single one is a contender for the title.",
+            "That scroll was DEVASTATING. Three pages in one swipe. UNHEARD OF.",
+            "The cursor just did a SUPLEX on that dropdown menu. Beautiful technique.",
+            "LOOK at that keystroke speed. This is CHAMPIONSHIP level typing.",
+            "A new window SLAMS open. The crowd goes WILD.",
+            "That right-click was VICIOUS. The context menu never stood a chance.",
+        ],
+        "closes": [
+            "SOMEBODY STOP THE MATCH. This user has a FAMILY.",
+            "AND THE CROWD GOES WILD. What a performance. What a NIGHT.",
+            "THAT MAN HAD A FAMILY and he just closed the tab WITHOUT SAVING.",
+            "This is HISTORY in the making, folks. HISTORY.",
+            "THE REF IS DOWN. THE TABS ARE DOWN. EVERYTHING IS DOWN.",
+            "IS IT OVER? NO. The cursor is STILL MOVING. This match continues.",
+        ],
+    },
+}
+
+
+def _compose_styled_commentary(
+    style: str,
     app_name: str,
     window_title: str,
     observations: List[str],
@@ -1130,6 +1500,45 @@ def _compose_commentary(
     turn_index: int,
     profanity_level: str,
 ) -> str:
+    """Compose fallback commentary for styles that use template pools."""
+    app = app_name or "this app"
+    topic = _topic_from_context(app_name, window_title, observations)
+    content_cue = _content_cue(app_name, window_title, topic)
+
+    templates = _STYLE_TEMPLATES[style]
+    lead = _select_variant(templates["leads"], history_lines, turn_index).format(
+        app=app, content_cue=content_cue,
+    )
+    detail = _select_variant(templates["details"], history_lines, turn_index + 1).format(
+        app=app, content_cue=content_cue,
+    )
+    close = _select_variant(templates["closes"], history_lines, turn_index + 2)
+
+    line = f"{lead} {detail} {close}"
+    return _ascii_only(line)
+
+
+def _compose_commentary(
+    app_name: str,
+    window_title: str,
+    observations: List[str],
+    actions: List[str],
+    history_lines: List[str],
+    context_history: List[str],
+    turn_index: int,
+    profanity_level: str,
+    style: str = "sports",
+) -> str:
+    if style == "nature":
+        return _compose_nature_commentary(
+            app_name, window_title, observations, actions,
+            history_lines, context_history, turn_index,
+        )
+    if style in _STYLE_TEMPLATES:
+        return _compose_styled_commentary(
+            style, app_name, window_title, observations, actions,
+            history_lines, context_history, turn_index, profanity_level,
+        )
     app = app_name or "this app"
     window = _safe_snippet(window_title)
     topic = _topic_from_context(app_name, window_title, observations)
@@ -1305,10 +1714,29 @@ def _compose_commentary(
     return _ascii_only(line)
 
 
+_WINDOW_NOISE_PATTERNS = [
+    re.compile(r"\s*-\s*High memory usage\s*-\s*\d+\s*MB\s*", re.IGNORECASE),
+    re.compile(r"\s*-\s*\d+\s*MB\s*", re.IGNORECASE),
+    re.compile(r"\s*-\s*Low memory\s*", re.IGNORECASE),
+    re.compile(r"\s*-\s*Not responding\s*", re.IGNORECASE),
+]
+
+
+def _clean_window_title(text: str) -> str:
+    """Strip browser chrome noise (memory warnings, etc.) from window titles."""
+    if not text:
+        return text
+    for pattern in _WINDOW_NOISE_PATTERNS:
+        text = pattern.sub(" - ", text)
+    text = re.sub(r"(\s*-\s*)+", " - ", text).strip(" -")
+    return text
+
+
 def _safe_snippet(text: str, limit: int = 70) -> str:
     if not text:
         return ""
-    cleaned = re.sub(r"\s+", " ", text).strip()
+    cleaned = _clean_window_title(text)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
     cleaned = re.sub(r"\S+@\S+", "", cleaned)
     cleaned = re.sub(r"\b\d{5,}\b", "", cleaned)
     cleaned = cleaned.replace("\"", "").replace("`", "").replace("\u201c", "").replace("\u201d", "")
@@ -1318,17 +1746,11 @@ def _safe_snippet(text: str, limit: int = 70) -> str:
     return cleaned
 
 
-def _ensure_context(line: Optional[str], app_name: str, window_title: str) -> Optional[str]:
-    if not line:
-        return line
-    if _mentions_context(line, app_name, window_title):
-        return line
-    app = app_name or "the current app"
-    window = _safe_snippet(window_title)
-    prefix = f"In {app}"
-    if window:
-        prefix = f"{prefix}, window {window}"
-    return f"{prefix}, {_lowercase_initial(line)}"
+def _ensure_context(
+    line: Optional[str], app_name: str, window_title: str, style: str = "",
+) -> Optional[str]:
+    """Pass through — the prompt tells Gemini to reference context naturally."""
+    return line
 
 
 def _ensure_punctuation(line: Optional[str]) -> Optional[str]:
@@ -1387,7 +1809,7 @@ def _expand_line(
             extras.append(f"That switch into {app_name} shifts the rhythm, but the focus holds.")
 
     if _too_similar(line, history_lines):
-        flair = _select_variant(_flair_pool(topic, config.profanity_level), history_lines, turn_index)
+        flair = _select_variant(_flair_pool(topic, config.profanity_level, config.narration_style), history_lines, turn_index)
         if flair:
             extras.insert(0, flair)
 

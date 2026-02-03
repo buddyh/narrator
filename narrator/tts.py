@@ -78,6 +78,12 @@ async def stream_tts(
         )
 
     voice_id = config.voice_id
+    # Per-style voice override
+    style_vid = config.style_voice_ids.get(config.narration_style)
+    if style_vid:
+        voice_id = style_vid
+    elif config.narration_style == "nature" and config.nature_voice_id:
+        voice_id = config.nature_voice_id
     if not voice_id:
         if not config.voice_name:
             raise ValueError(

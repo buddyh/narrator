@@ -7,11 +7,14 @@ import asyncio
 from collections import deque
 from dataclasses import dataclass, replace
 import hashlib
+import itertools
+import json
+import os
 import queue
 import sys
 import threading
 import time
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from dotenv import find_dotenv, load_dotenv
 
@@ -29,9 +32,34 @@ from narrator.tts import stream_tts
 from narrator.vision import VisionTracker, default_metrics, VisualMetrics
 
 
+def _parse_duration(value: str) -> Optional[float]:
+    """Parse a duration string like '2m', '90s', '1h', '5min' into seconds."""
+    import re
+    value = value.strip().lower()
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(s|sec|m|min|h|hr|hour)?", value)
+    if not m:
+        return None
+    num = float(m.group(1))
+    unit = m.group(2) or "s"
+    if unit in ("m", "min"):
+        return num * 60
+    if unit in ("h", "hr", "hour"):
+        return num * 3600
+    return num
+
+
 def _override_config(config: AppConfig, args: argparse.Namespace) -> AppConfig:
+    from narrator.config import VALID_NARRATION_STYLES
+
+    style = getattr(args, "style", None)
+    if style and style.lower() in VALID_NARRATION_STYLES:
+        style = style.lower()
+    else:
+        style = None
+
     if (
-        args.interval is None
+        style is None
+        and args.interval is None
         and args.min_gap is None
         and not args.verbose
         and args.screen_index is None
@@ -40,6 +68,7 @@ def _override_config(config: AppConfig, args: argparse.Namespace) -> AppConfig:
         return config
     return replace(
         config,
+        narration_style=style or config.narration_style,
         interval_sec=args.interval or config.interval_sec,
         min_gap_sec=args.min_gap or config.min_gap_sec,
         verbose=config.verbose or args.verbose,
@@ -84,6 +113,61 @@ def _line_fingerprint(line: str) -> str:
     return hashlib.sha1(line.encode("utf-8")).hexdigest()[:10]
 
 
+def _token_set(text: str) -> set[str]:
+    import re
+    return set(re.findall(r"[a-z]{4,}", text.lower()))
+
+
+def _too_similar_to_recent(line: str, recent: deque[str]) -> bool:
+    if not recent:
+        return False
+    tokens = _token_set(line)
+    if not tokens:
+        return False
+    for prev in recent:
+        prev_tokens = _token_set(prev)
+        if not prev_tokens:
+            continue
+        jaccard = len(tokens & prev_tokens) / len(tokens | prev_tokens)
+        if jaccard >= 0.55:
+            return True
+    return False
+
+
+@dataclass(frozen=True)
+class _LaneProfile:
+    name: str
+    thinking_budget: int
+    char_target: str
+    min_chars: int
+    min_words: int
+
+    def as_overrides(self) -> Dict[str, Any]:
+        return {
+            "thinking_budget": self.thinking_budget,
+            "char_target": self.char_target,
+            "min_chars": self.min_chars,
+            "min_words": self.min_words,
+        }
+
+
+_SHORT_LANE = _LaneProfile(
+    name="short",
+    thinking_budget=48,
+    char_target="60-90",
+    min_chars=50,
+    min_words=8,
+)
+
+_LONG_LANE = _LaneProfile(
+    name="long",
+    thinking_budget=128,
+    char_target="120-180",
+    min_chars=80,
+    min_words=14,
+)
+
+
 _STALE_PREFIXES = (
     "A moment ago in {app},",
     "Seconds back in {app},",
@@ -95,13 +179,39 @@ _STALE_PREFIXES = (
 
 
 def _prefix_stale_context(line: str, app_name: str, turn_index: int) -> str:
+    import re
     prefix = _STALE_PREFIXES[turn_index % len(_STALE_PREFIXES)]
     trimmed = line.lstrip(" ,:-")
+    # Strip existing "In {App}," / "In the {App} thicket," leads to avoid double-context
+    trimmed = re.sub(
+        r"^(In|On|Over in|Back in|Still in)\s+[^,]{3,40},\s*",
+        "",
+        trimmed,
+        count=1,
+    )
+    trimmed = trimmed[:1].upper() + trimmed[1:] if trimmed else trimmed
     return f"{prefix.format(app=app_name)} {trimmed}"
 
 
+def _resolve_ambient_wav(config: AppConfig) -> Optional[str]:
+    """Pick the ambient WAV: explicit env var > style_ambient > auto-detect."""
+    if config.ambient_wav:
+        return config.ambient_wav
+    # Check style_ambient from YAML config
+    style_path = config.style_ambient.get(config.narration_style)
+    if style_path:
+        return style_path
+    # Auto-detect ambient/{style}.wav relative to package
+    pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    auto = os.path.join(pkg_dir, "ambient", f"{config.narration_style}.wav")
+    if os.path.isfile(auto):
+        return auto
+    return None
+
+
 def _start_ambient(config: AppConfig) -> Optional[AmbientPlayer]:
-    if config.dry_run or not config.ambient_wav:
+    wav = _resolve_ambient_wav(config)
+    if config.dry_run or not wav:
         return None
     pcm_format = parse_pcm_format(config.output_format)
     if not pcm_format:
@@ -112,7 +222,7 @@ def _start_ambient(config: AppConfig) -> Optional[AmbientPlayer]:
         return None
     try:
         ambient = AmbientPlayer(
-            config.ambient_wav,
+            wav,
             pcm_format,
             gain=config.ambient_gain,
             crossfade_sec=config.ambient_crossfade_sec,
@@ -136,6 +246,7 @@ class _SpeechItem:
     enqueue_mono: float
     app_name: str
     window_title: str
+    lane: str = ""
 
 
 class _SpeechQueue:
@@ -145,6 +256,8 @@ class _SpeechQueue:
             maxsize=config.queue_max
         )
         self._stop = threading.Event()
+        self._recent_hashes: deque[str] = deque(maxlen=8)
+        self._recent_lines: deque[str] = deque(maxlen=6)
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
         self._timeline = timeline
@@ -181,9 +294,11 @@ class _SpeechQueue:
                             app=_truncate(item_app),
                             current_app=_truncate(current_app),
                         )
-                    self._queue.task_done()
                     continue
                 if self._timeline:
+                    extra = {}
+                    if item.lane:
+                        extra["lane"] = item.lane
                     self._timeline.log(
                         "tts_start",
                         line_id=line_id,
@@ -197,6 +312,7 @@ class _SpeechQueue:
                         window=_truncate(item.window_title),
                         current_app=_truncate(current_ctx.app_name),
                         current_window=_truncate(current_ctx.window_title),
+                        **extra,
                     )
                 _speak_line(line, self._config)
                 end_mono = time.monotonic()
@@ -228,6 +344,28 @@ class _SpeechQueue:
     def enqueue(self, item: _SpeechItem) -> bool:
         if self._queue.full():
             return False
+        if item.line_hash in self._recent_hashes:
+            if self._timeline:
+                self._timeline.log(
+                    "queue_dedup",
+                    line_id=item.line_id,
+                    capture_id=item.capture_id,
+                    hash=item.line_hash,
+                    reason="exact",
+                )
+            return False
+        if _too_similar_to_recent(item.line, self._recent_lines):
+            if self._timeline:
+                self._timeline.log(
+                    "queue_dedup",
+                    line_id=item.line_id,
+                    capture_id=item.capture_id,
+                    hash=item.line_hash,
+                    reason="similar",
+                )
+            return False
+        self._recent_hashes.append(item.line_hash)
+        self._recent_lines.append(item.line)
         self._queue.put(item)
         if self._timeline:
             age_ms = (item.enqueue_mono - item.capture_mono) * 1000.0
@@ -394,8 +532,148 @@ class _GeminiGate:
         return self._last_app, self._last_window
 
 
-def _run_loop_gemini(config: AppConfig) -> None:
+class _RuntimeState:
+    """Mutable runtime state for settings that can change mid-session."""
+
+    def __init__(self, config: AppConfig) -> None:
+        self.style = config.narration_style
+        self.profanity = config.profanity_level
+        self.paused = False
+        self.dual_lane = config.dual_lane
+        self.turn_index = 0
+
+    def apply_to_config(self, config: AppConfig) -> AppConfig:
+        """Return a config with runtime-mutable fields overridden."""
+        return replace(
+            config,
+            narration_style=self.style,
+            profanity_level=self.profanity,
+            dual_lane=self.dual_lane,
+        )
+
+
+def _check_control_file(
+    control_path: str,
+    state: _RuntimeState,
+    timeline: "_Timeline",
+    verbose: bool,
+) -> list[str]:
+    """Read and process commands from the control file. Returns list of events."""
+    if not control_path:
+        return []
+    try:
+        with open(control_path, "r", encoding="utf-8") as f:
+            raw = f.read().strip()
+        os.remove(control_path)
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return []
+    if not raw:
+        return []
+
+    events: list[str] = []
+    try:
+        commands = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+
+    # Support single command or list of commands
+    if isinstance(commands, dict):
+        commands = [commands]
+    if not isinstance(commands, list):
+        return []
+
+    from narrator.config import VALID_NARRATION_STYLES
+
+    for cmd in commands:
+        if not isinstance(cmd, dict):
+            continue
+        action = cmd.get("command", "").strip().lower()
+
+        if action == "style":
+            value = str(cmd.get("value", "")).strip().lower()
+            if value in VALID_NARRATION_STYLES and value != state.style:
+                old = state.style
+                state.style = value
+                events.append(f"style:{old}->{value}")
+                timeline.log("control", command="style", old=old, new=value)
+                if verbose:
+                    print(f"[Control] Style changed: {old} -> {value}", file=sys.stderr)
+
+        elif action == "profanity":
+            value = str(cmd.get("value", "")).strip().lower()
+            if value in {"low", "medium", "high"} and value != state.profanity:
+                old = state.profanity
+                state.profanity = value
+                events.append(f"profanity:{old}->{value}")
+                timeline.log("control", command="profanity", old=old, new=value)
+                if verbose:
+                    print(f"[Control] Profanity changed: {old} -> {value}", file=sys.stderr)
+
+        elif action == "pause":
+            if not state.paused:
+                state.paused = True
+                events.append("paused")
+                timeline.log("control", command="pause")
+                if verbose:
+                    print("[Control] Paused", file=sys.stderr)
+
+        elif action == "resume":
+            if state.paused:
+                state.paused = False
+                events.append("resumed")
+                timeline.log("control", command="resume")
+                if verbose:
+                    print("[Control] Resumed", file=sys.stderr)
+
+        elif action == "dual_lane":
+            value = cmd.get("value")
+            if isinstance(value, bool) and value != state.dual_lane:
+                state.dual_lane = value
+                events.append(f"dual_lane:{value}")
+                timeline.log("control", command="dual_lane", value=value)
+                if verbose:
+                    print(f"[Control] Dual lane: {value}", file=sys.stderr)
+
+    return events
+
+
+def _write_status_file(
+    status_path: str,
+    state: _RuntimeState,
+    config: AppConfig,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Write current runtime state to a status file for external readers."""
+    if not status_path:
+        return
+    status = {
+        "style": state.style,
+        "profanity": state.profanity,
+        "paused": state.paused,
+        "dual_lane": state.dual_lane,
+        "turn_index": state.turn_index,
+        "pid": os.getpid(),
+    }
+    if extra:
+        status.update(extra)
+    try:
+        tmp = status_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(status, f)
+        os.replace(tmp, status_path)
+    except OSError:
+        pass
+
+
+def _run_loop_gemini(
+    config: AppConfig,
+    control_file: Optional[str] = None,
+    status_file: Optional[str] = None,
+) -> None:
     """Run the narration loop using Gemini for generation."""
+    runtime = _RuntimeState(config)
     gate = _GeminiGate(
         min_gap_sec=config.min_gap_sec, diff_threshold=config.diff_threshold
     )
@@ -418,18 +696,50 @@ def _run_loop_gemini(config: AppConfig) -> None:
     turn_index = 0
     request_id = 0
     capture_id = 0
+    dual_lane = config.dual_lane
+    lane_cycle = itertools.cycle([_SHORT_LANE, _LONG_LANE]) if dual_lane else None
     _log_verbose(
         config,
         f"screen_index={config.screen_index} screencapture_display={config.screencapture_display}",
     )
+    if dual_lane:
+        _log_verbose(config, "dual_lane=enabled queue_max=2")
     timeline.log(
         "start",
         mode="gemini",
         interval=config.interval_sec,
         min_gap=config.min_gap_sec,
+        dual_lane=dual_lane,
     )
     try:
         while True:
+            # Check for live control commands
+            control_events = _check_control_file(
+                control_file or "", runtime, timeline, config.verbose,
+            )
+            if control_events:
+                old_style = config.narration_style
+                # Rebuild effective config with runtime overrides
+                config = runtime.apply_to_config(config)
+                # Update dual_lane and lane_cycle if changed
+                if runtime.dual_lane != dual_lane:
+                    dual_lane = runtime.dual_lane
+                    lane_cycle = itertools.cycle([_SHORT_LANE, _LONG_LANE]) if dual_lane else None
+                # Swap ambient track if style changed
+                if config.narration_style != old_style:
+                    new_wav = _resolve_ambient_wav(config)
+                    if ambient:
+                        ambient.__exit__(None, None, None)
+                        ambient = None
+                    if new_wav:
+                        ambient = _start_ambient(config)
+                _write_status_file(status_file or "", runtime, config)
+
+            if runtime.paused:
+                _write_status_file(status_file or "", runtime, config)
+                time.sleep(0.5)
+                continue
+
             if gemini_fatal:
                 time.sleep(config.interval_sec)
                 continue
@@ -439,22 +749,23 @@ def _run_loop_gemini(config: AppConfig) -> None:
                     f"skip=queue_full size={speech_queue.size()}",
                 )
                 timeline.log("skip", reason="queue_full", size=speech_queue.size())
-                time.sleep(config.interval_sec)
+                time.sleep(0.1 if dual_lane else config.interval_sec)
                 continue
             ctx = capture_context()
             app_name = (ctx.app_name or "Unknown App").strip()
             window_title = (ctx.window_title or "").strip()
-            cooldown = gate.cooldown_remaining()
-            last_app, last_window = gate.last_context()
-            if (
-                cooldown > 0
-                and ctx.app_name == last_app
-                and ctx.window_title == last_window
-            ):
-                _log_verbose(config, f"skip=cooldown {cooldown:.2f}s")
-                timeline.log("skip", reason="cooldown", remaining=f"{cooldown:.2f}")
-                time.sleep(config.interval_sec)
-                continue
+            if not dual_lane:
+                cooldown = gate.cooldown_remaining()
+                last_app, last_window = gate.last_context()
+                if (
+                    cooldown > 0
+                    and ctx.app_name == last_app
+                    and ctx.window_title == last_window
+                ):
+                    _log_verbose(config, f"skip=cooldown {cooldown:.2f}s")
+                    timeline.log("skip", reason="cooldown", remaining=f"{cooldown:.2f}")
+                    time.sleep(config.interval_sec)
+                    continue
             metrics = default_metrics()
             png_bytes = b""
             capture_start = time.monotonic()
@@ -510,9 +821,19 @@ def _run_loop_gemini(config: AppConfig) -> None:
                     window=_truncate(window_title),
                 )
 
-            should_request, reason = gate.evaluate(
-                app_name, window_title, metrics, config.ignore_apps
-            )
+            if dual_lane:
+                # In dual mode, always request — pacing comes from queue fullness + API latency
+                if app_name in config.ignore_apps:
+                    _log_verbose(config, f"skip=ignored_app app={_truncate(app_name)}")
+                    timeline.log("skip", reason="ignored_app", app=_truncate(app_name))
+                    time.sleep(config.interval_sec)
+                    continue
+                should_request = True
+                reason = "dual_lane"
+            else:
+                should_request, reason = gate.evaluate(
+                    app_name, window_title, metrics, config.ignore_apps
+                )
             if not should_request:
                 _log_verbose(
                     config,
@@ -530,6 +851,9 @@ def _run_loop_gemini(config: AppConfig) -> None:
                 continue
 
             gate.mark_attempt()
+            current_lane = next(lane_cycle) if lane_cycle else None
+            lane_overrides = current_lane.as_overrides() if current_lane else None
+            lane_name = current_lane.name if current_lane else ""
             request_id += 1
             request_mono = time.monotonic()
             capture_age_ms = (request_mono - capture_mono) * 1000.0
@@ -548,6 +872,7 @@ def _run_loop_gemini(config: AppConfig) -> None:
                 capture_age_ms=f"{capture_age_ms:.0f}",
                 app=_truncate(app_name),
                 window=_truncate(window_title),
+                **({"lane": lane_name} if lane_name else {}),
             )
             _log_verbose(
                 config,
@@ -566,6 +891,7 @@ def _run_loop_gemini(config: AppConfig) -> None:
                     list(context_history),
                     turn_index,
                     verbose=config.verbose,
+                    lane_overrides=lane_overrides,
                 )
                 response_mono = time.monotonic()
                 request_ms = (response_mono - request_start) * 1000.0
@@ -578,6 +904,7 @@ def _run_loop_gemini(config: AppConfig) -> None:
                     age_ms=f"{response_age_ms:.0f}",
                     attempts=usage.attempts,
                     source=source,
+                    **({"lane": lane_name} if lane_name else {}),
                 )
             except Exception as exc:
                 message = str(exc)
@@ -691,6 +1018,7 @@ def _run_loop_gemini(config: AppConfig) -> None:
                     hash=line_hash,
                     chars=len(line),
                     source=source,
+                    **({"lane": lane_name} if lane_name else {}),
                 )
                 enqueue_mono = time.monotonic()
                 age_ms = (enqueue_mono - capture_mono) * 1000.0
@@ -714,7 +1042,7 @@ def _run_loop_gemini(config: AppConfig) -> None:
                     stale_reasons.append("age")
                     if context_changed:
                         stale_reasons.append("context")
-                if context_changed and not age_exceeded:
+                if context_changed and not age_exceeded and config.narration_style != "nature":
                     line = _prefix_stale_context(line, app_name, turn_index)
                     timeline.log(
                         "stale_context_allow",
@@ -803,10 +1131,13 @@ def _run_loop_gemini(config: AppConfig) -> None:
                     time.sleep(config.interval_sec)
                     continue
                 if config.dry_run:
-                    print(line)
+                    lane_label = f" [{lane_name}]" if lane_name else ""
+                    print(f"{line}{lane_label}")
                     gate.mark_spoken(app_name, window_title)
                     history_lines.append(line)
                     turn_index += 1
+                    if dual_lane:
+                        continue  # skip sleep, immediately loop
                 else:
                     if speech_queue and speech_queue.enqueue(
                         _SpeechItem(
@@ -820,6 +1151,7 @@ def _run_loop_gemini(config: AppConfig) -> None:
                             enqueue_mono=enqueue_mono,
                             app_name=app_name,
                             window_title=window_title,
+                            lane=lane_name,
                         )
                     ):
                         print(f"Announcer: {line}")
@@ -830,10 +1162,13 @@ def _run_loop_gemini(config: AppConfig) -> None:
                             hash=line_hash,
                             chars=len(line),
                             age_ms=f"{age_ms:.0f}",
+                            **({"lane": lane_name} if lane_name else {}),
                         )
                         gate.mark_spoken(app_name, window_title)
                         history_lines.append(line)
                         turn_index += 1
+                        if dual_lane:
+                            continue  # skip sleep, immediately loop
                     else:
                         _log_verbose(config, "skip=queue_full")
                         timeline.log("skip", reason="queue_full")
@@ -896,12 +1231,20 @@ def _run_loop_gemini(config: AppConfig) -> None:
                             last_fallback_time = now
                             gate.mark_spoken(app_name, window_title)
 
+            runtime.turn_index = turn_index
+            _write_status_file(status_file or "", runtime, config)
             time.sleep(config.interval_sec)
     finally:
         if ambient:
             ambient.__exit__(None, None, None)
         if speech_queue:
             speech_queue.shutdown()
+        # Clean up status file on exit
+        if status_file:
+            try:
+                os.remove(status_file)
+            except OSError:
+                pass
 
 
 def _run_loop_local(config: AppConfig) -> None:
@@ -956,6 +1299,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Live sports-style narrator for your computer activity."
     )
+    parser.add_argument(
+        "style",
+        nargs="?",
+        default=None,
+        help="Narration style (or 'list' to show available styles)",
+    )
+    parser.add_argument(
+        "-l", "--list",
+        action="store_true",
+        help="List available narration styles and exit.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print lines only.")
     parser.add_argument(
         "--verbose",
@@ -991,8 +1345,93 @@ def main(argv: Optional[list[str]] = None) -> int:
         default=None,
         help="screencapture display id to capture (macOS -D value).",
     )
+    parser.add_argument(
+        "--control-file",
+        type=str,
+        default=None,
+        help="Path to a JSON control file for live settings changes.",
+    )
+    parser.add_argument(
+        "--status-file",
+        type=str,
+        default=None,
+        help="Path to write runtime status JSON for external readers.",
+    )
+    parser.add_argument(
+        "-t", "--time",
+        type=str,
+        default=None,
+        help="Auto-stop after duration, e.g. 2m, 5m, 90s, 1h.",
+    )
 
     args = parser.parse_args(argv)
+
+    # Style descriptions for display
+    _STYLE_INFO = {
+        "sports":     "Punchy play-by-play announcer, light roast",
+        "nature":     "David Attenborough nature documentary",
+        "horror":     "Creeping dread, ominous foreshadowing",
+        "noir":       "Hard-boiled detective, rain-soaked cynicism",
+        "reality_tv": "Ditzy confessional booth, tech-clueless drama",
+        "asmr":       "Whispered meditation over mundane browsing",
+        "wrestling":  "BAH GAWD maximum hype announcer",
+    }
+
+    def _print_styles() -> None:
+        from narrator.config import _load_yaml_config, VALID_NARRATION_STYLES
+        yaml_cfg = _load_yaml_config()
+        voices = yaml_cfg.get("voices", {}) or {}
+        ambient = yaml_cfg.get("ambient", {}) or {}
+        print("\nAvailable narration styles:\n")
+        for i, style in enumerate(sorted(VALID_NARRATION_STYLES), 1):
+            desc = _STYLE_INFO.get(style, "")
+            has_voice = "voice" if voices.get(style) else "     "
+            has_ambient = "ambient" if ambient.get(style) else "       "
+            print(f"  {i:2}. {style:<12} {desc:<50} [{has_voice}] [{has_ambient}]")
+        print()
+
+    def _pick_style() -> Optional[str]:
+        from narrator.config import VALID_NARRATION_STYLES
+        _print_styles()
+        styles = sorted(VALID_NARRATION_STYLES)
+        try:
+            choice = input("Pick a style (number or name): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(styles):
+                return styles[idx]
+        if choice in VALID_NARRATION_STYLES:
+            return choice
+        print(f"Unknown style: {choice}", file=sys.stderr)
+        return None
+
+    # Handle --list or "list" as positional
+    if args.list or (args.style and args.style.lower() == "list"):
+        _print_styles()
+        return 0
+
+    # Interactive picker if no style given and stdin is a terminal
+    if args.style is None and sys.stdin.isatty() and not args.dry_run:
+        picked = _pick_style()
+        if picked:
+            args.style = picked
+        # If they didn't pick, fall through to default from config
+
+    # Parse and schedule auto-stop timer
+    stop_timer = None
+    if args.time:
+        duration = _parse_duration(args.time)
+        if duration is None or duration <= 0:
+            print(f"Invalid duration: {args.time}", file=sys.stderr)
+            return 2
+        import signal
+        def _timeout_handler(*_a: object) -> None:
+            print(f"\n[Narrator] Time limit reached ({args.time}). Stopping.", file=sys.stderr)
+            raise KeyboardInterrupt
+        signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.setitimer(signal.ITIMER_REAL, duration)
 
     dotenv_path = find_dotenv()
     load_dotenv(dotenv_path if dotenv_path else None)
@@ -1021,7 +1460,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             _run_loop_local(config)
         else:
             print("[Narrator] Using Gemini narration.")
-            _run_loop_gemini(config)
+            _run_loop_gemini(
+                config,
+                control_file=args.control_file,
+                status_file=args.status_file,
+            )
     except KeyboardInterrupt:
         return 0
 
