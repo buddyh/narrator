@@ -93,7 +93,7 @@ Supported commands:
 | Command | Value | Example |
 |---|---|---|
 | `style` | Style name | `{"command": "style", "value": "wrestling"}` |
-| `profanity` | `low`, `medium`, `high` | `{"command": "profanity", "value": "low"}` |
+| `profanity` | `off`, `low`, `high` | `{"command": "profanity", "value": "low"}` |
 | `pause` | (none) | `{"command": "pause"}` |
 | `resume` | (none) | `{"command": "resume"}` |
 | `dual_lane` | `true` / `false` | `{"command": "dual_lane", "value": true}` |

@@ -281,7 +281,7 @@ def load_config(dry_run: bool = False, require_gemini: bool = False) -> AppConfi
     profanity_level = os.getenv(
         "NARRATOR_PROFANITY", yaml_profanity or str(DEFAULT_PROFANITY_LEVEL)
     ).strip().lower()
-    if profanity_level not in {"low", "medium", "high"}:
+    if profanity_level not in {"off", "low", "high"}:
         profanity_level = DEFAULT_PROFANITY_LEVEL
     ambient_wav = os.getenv("NARRATOR_AMBIENT_WAV", "").strip()
     if not ambient_wav:

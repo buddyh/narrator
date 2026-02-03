@@ -1121,7 +1121,7 @@ def _build_action_pool(
             "hovering to post",
             "refreshing the feed for no good reason",
         ]
-        if profanity_level in {"medium", "high"}:
+        if profanity_level in {"low", "high"}:
             pool.append("doomscrolling X and wasting time")
         if profanity_level == "high":
             pool.append("doomscrolling X and wasting a bunch of fucking time")
@@ -1224,7 +1224,7 @@ def _flair_pool(topic: str, profanity_level: str, style: str = "sports") -> List
         "The cursor is hovering like a referee about to blow a whistle.",
         "This is a long drive with no touchdown in sight.",
     ]
-    if profanity_level in {"medium", "high"}:
+    if profanity_level in {"low", "high"}:
         base.extend(
             [
                 "This stretch is chewing up time like its a full-time job.",
@@ -1250,7 +1250,7 @@ def _flair_pool(topic: str, profanity_level: str, style: str = "sports") -> List
             "The feed is loud and the discipline is quiet.",
             "The timeline is pulling like gravity and its not letting go.",
         ]
-        if profanity_level in {"medium", "high"}:
+        if profanity_level in {"low", "high"}:
             extra.append("Just burning time in the feed like its a sport.")
         if profanity_level == "high":
             extra.append("Just wasting a bunch of fucking time doomscrolling X.")
@@ -1272,7 +1272,7 @@ def _flair_pool(topic: str, profanity_level: str, style: str = "sports") -> List
             "This page is a treadmill and the feet keep moving.",
             "Its endless browsing disguised as progress.",
         ]
-        if profanity_level in {"medium", "high"}:
+        if profanity_level in {"low", "high"}:
             extra.append("This page is a sinkhole for minutes.")
         if profanity_level == "high":
             extra.append("Chrome is open and the procrastination is loud.")

@@ -82,7 +82,7 @@ Then write commands to the control file:
 # Switch style
 echo '{"command": "style", "value": "wrestling"}' > /tmp/narrator-ctl.json
 
-# Change profanity level (low/medium/high)
+# Change profanity level (off/low/high)
 echo '{"command": "profanity", "value": "low"}' > /tmp/narrator-ctl.json
 
 # Pause / resume

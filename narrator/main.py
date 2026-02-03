@@ -603,7 +603,7 @@ def _check_control_file(
 
         elif action == "profanity":
             value = str(cmd.get("value", "")).strip().lower()
-            if value in {"low", "medium", "high"} and value != state.profanity:
+            if value in {"off", "low", "high"} and value != state.profanity:
                 old = state.profanity
                 state.profanity = value
                 events.append(f"profanity:{old}->{value}")
